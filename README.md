@@ -1,10 +1,11 @@
-markdown
-
 ## 30-Days-Of-React-Projects
 
-**Description:**
-
 A collection of React projects ranging from basic to advanced.
+
+### Tech Stack Used
+
+1. React + vite
+2. TailwindCSS
 
 ### Installation
 
