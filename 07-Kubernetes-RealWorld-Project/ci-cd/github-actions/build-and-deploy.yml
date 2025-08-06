@@ -1,0 +1,491 @@
+name: CI/CD Pipeline - E-Commerce Platform
+
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - 'apps/**'
+      - 'k8s-manifests/**'
+      - '.github/workflows/**'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'apps/**'
+      - 'k8s-manifests/**'
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  CLUSTER_NAME: k8s-ecommerce
+  ARGOCD_SERVER: argocd.example.com
+
+jobs:
+  # Code Quality and Security Checks
+  code-quality:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+
+    - name: Cache pip dependencies
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install flake8 black pytest pytest-cov safety bandit
+        find apps -name requirements.txt -exec pip install -r {} \;
+
+    - name: Code formatting check
+      run: |
+        black --check --diff apps/
+
+    - name: Lint code
+      run: |
+        flake8 apps/ --count --select=E9,F63,F7,F82 --show-source --statistics
+        flake8 apps/ --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+
+    - name: Security scan - Bandit
+      run: |
+        bandit -r apps/ -f json -o bandit-report.json
+        bandit -r apps/
+
+    - name: Dependency vulnerability scan
+      run: |
+        find apps -name requirements.txt -exec safety check --file {} \;
+
+    - name: Upload security scan results
+      uses: actions/upload-artifact@v3
+      if: always()
+      with:
+        name: security-scan-results
+        path: bandit-report.json
+
+  # Unit and Integration Tests
+  test:
+    runs-on: ubuntu-latest
+    needs: code-quality
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_PASSWORD: test_password
+          POSTGRES_USER: test_user
+          POSTGRES_DB: test_ecommerce
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install pytest pytest-cov pytest-asyncio httpx
+        find apps -name requirements.txt -exec pip install -r {} \;
+
+    - name: Run unit tests
+      env:
+        DATABASE_URL: postgresql://test_user:test_password@localhost:5432/test_ecommerce
+        JWT_SECRET: test-secret-key
+      run: |
+        cd apps/user-service
+        pytest tests/ -v --cov=. --cov-report=xml --cov-report=html
+
+    - name: Upload test coverage
+      uses: codecov/codecov-action@v3
+      with:
+        file: ./apps/user-service/coverage.xml
+        flags: unittests
+        name: codecov-umbrella
+
+    - name: Integration tests
+      env:
+        DATABASE_URL: postgresql://test_user:test_password@localhost:5432/test_ecommerce
+        JWT_SECRET: test-secret-key
+      run: |
+        cd apps/user-service
+        python -m pytest tests/integration/ -v
+
+  # Build and push Docker images
+  build:
+    runs-on: ubuntu-latest
+    needs: [code-quality, test]
+    if: github.event_name == 'push'
+    strategy:
+      matrix:
+        service: [user-service, product-service, order-service]
+    
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tags }}
+      image-digest: ${{ steps.build.outputs.digest }}
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Log in to Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/${{ matrix.service }}
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=sha,prefix={{branch}}-
+          type=raw,value=latest,enable={{is_default_branch}}
+
+    - name: Build and push Docker image
+      id: build
+      uses: docker/build-push-action@v5
+      with:
+        context: ./apps/${{ matrix.service }}
+        platforms: linux/amd64,linux/arm64
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        build-args: |
+          BUILD_DATE=${{ fromJSON(steps.meta.outputs.json).labels['org.opencontainers.image.created'] }}
+          VCS_REF=${{ fromJSON(steps.meta.outputs.json).labels['org.opencontainers.image.revision'] }}
+
+    - name: Run Trivy vulnerability scanner
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: ${{ steps.meta.outputs.tags }}
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+
+    - name: Upload Trivy scan results
+      uses: github/codeql-action/upload-sarif@v2
+      if: always()
+      with:
+        sarif_file: 'trivy-results.sarif'
+
+  # Kubernetes manifest validation and security scanning
+  k8s-validation:
+    runs-on: ubuntu-latest
+    needs: code-quality
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install kubectl
+      uses: azure/setup-kubectl@v3
+      with:
+        version: 'v1.28.0'
+
+    - name: Install kubeval
+      run: |
+        wget https://github.com/instrumenta/kubeval/releases/latest/download/kubeval-linux-amd64.tar.gz
+        tar xf kubeval-linux-amd64.tar.gz
+        sudo mv kubeval /usr/local/bin
+
+    - name: Validate Kubernetes manifests
+      run: |
+        find k8s-manifests -name "*.yaml" -o -name "*.yml" | xargs kubeval
+
+    - name: Install Polaris
+      run: |
+        wget https://github.com/FairwindsOps/polaris/releases/latest/download/polaris_linux_amd64.tar.gz
+        tar -xzf polaris_linux_amd64.tar.gz
+        sudo mv polaris /usr/local/bin/
+
+    - name: Run Polaris audit
+      run: |
+        polaris audit --audit-path k8s-manifests/ --format json > polaris-audit.json
+        polaris audit --audit-path k8s-manifests/ --format pretty
+
+    - name: Upload Polaris results
+      uses: actions/upload-artifact@v3
+      with:
+        name: polaris-audit
+        path: polaris-audit.json
+
+    - name: Install Checkov
+      run: |
+        pip3 install checkov
+
+    - name: Run Checkov scan
+      run: |
+        checkov -d k8s-manifests/ --framework kubernetes --output json --output-file checkov-report.json
+        checkov -d k8s-manifests/ --framework kubernetes
+
+    - name: Upload Checkov results
+      uses: actions/upload-artifact@v3
+      if: always()
+      with:
+        name: checkov-report
+        path: checkov-report.json
+
+  # Deploy to staging environment
+  deploy-staging:
+    runs-on: ubuntu-latest
+    needs: [build, k8s-validation]
+    if: github.ref == 'refs/heads/develop'
+    environment: staging
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up kubectl
+      uses: azure/setup-kubectl@v3
+      with:
+        version: 'v1.28.0'
+
+    - name: Configure kubectl for staging
+      run: |
+        mkdir -p ~/.kube
+        echo "${{ secrets.STAGING_KUBECONFIG }}" | base64 -d > ~/.kube/config
+
+    - name: Install ArgoCD CLI
+      run: |
+        curl -sSL -o argocd https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+        chmod +x argocd
+        sudo mv argocd /usr/local/bin/
+
+    - name: Update image tags in manifests
+      run: |
+        cd k8s-manifests/overlays/staging
+        kustomize edit set image user-service=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/user-service:${{ github.sha }}
+        kustomize edit set image product-service=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/product-service:${{ github.sha }}
+        kustomize edit set image order-service=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/order-service:${{ github.sha }}
+
+    - name: Deploy to staging via ArgoCD
+      env:
+        ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
+      run: |
+        argocd app sync ecommerce-staging --server ${{ env.ARGOCD_SERVER }} --auth-token $ARGOCD_AUTH_TOKEN
+        argocd app wait ecommerce-staging --server ${{ env.ARGOCD_SERVER }} --auth-token $ARGOCD_AUTH_TOKEN
+
+    - name: Run smoke tests
+      run: |
+        kubectl wait --for=condition=available --timeout=300s deployment/user-service -n staging
+        kubectl port-forward -n staging svc/user-service 8080:80 &
+        sleep 10
+        curl -f http://localhost:8080/health || exit 1
+        echo "Smoke tests passed!"
+
+  # Deploy to production environment
+  deploy-production:
+    runs-on: ubuntu-latest
+    needs: [build, k8s-validation]
+    if: github.ref == 'refs/heads/main'
+    environment: production
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up kubectl
+      uses: azure/setup-kubectl@v3
+      with:
+        version: 'v1.28.0'
+
+    - name: Configure kubectl for production
+      run: |
+        mkdir -p ~/.kube
+        echo "${{ secrets.PRODUCTION_KUBECONFIG }}" | base64 -d > ~/.kube/config
+
+    - name: Install ArgoCD CLI
+      run: |
+        curl -sSL -o argocd https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+        chmod +x argocd
+        sudo mv argocd /usr/local/bin/
+
+    - name: Blue-Green deployment validation
+      run: |
+        # Validate current production state
+        kubectl get deployments -n production
+        kubectl get services -n production
+
+    - name: Update image tags in manifests
+      run: |
+        cd k8s-manifests/overlays/production
+        kustomize edit set image user-service=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/user-service:${{ github.sha }}
+        kustomize edit set image product-service=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/product-service:${{ github.sha }}
+        kustomize edit set image order-service=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/order-service:${{ github.sha }}
+
+    - name: Deploy to production via ArgoCD
+      env:
+        ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
+      run: |
+        # Sync with manual approval required
+        argocd app sync ecommerce-production --server ${{ env.ARGOCD_SERVER }} --auth-token $ARGOCD_AUTH_TOKEN --strategy hook
+        argocd app wait ecommerce-production --server ${{ env.ARGOCD_SERVER }} --auth-token $ARGOCD_AUTH_TOKEN --timeout 600
+
+    - name: Production health checks
+      run: |
+        kubectl wait --for=condition=available --timeout=600s deployment/user-service -n production
+        kubectl wait --for=condition=available --timeout=600s deployment/product-service -n production
+        kubectl wait --for=condition=available --timeout=600s deployment/order-service -n production
+        
+        # Run comprehensive health checks
+        kubectl port-forward -n production svc/user-service 8080:80 &
+        kubectl port-forward -n production svc/product-service 8081:80 &
+        kubectl port-forward -n production svc/order-service 8082:80 &
+        sleep 15
+        
+        curl -f http://localhost:8080/health || exit 1
+        curl -f http://localhost:8081/health || exit 1
+        curl -f http://localhost:8082/health || exit 1
+        
+        echo "Production deployment successful!"
+
+    - name: Rollback on failure
+      if: failure()
+      run: |
+        echo "Deployment failed, initiating rollback..."
+        argocd app rollback ecommerce-production --server ${{ env.ARGOCD_SERVER }} --auth-token ${{ secrets.ARGOCD_AUTH_TOKEN }}
+
+  # Performance and load testing
+  performance-test:
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    if: github.ref == 'refs/heads/develop'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install k6
+      run: |
+        sudo gpg -k
+        sudo gpg --no-default-keyring --keyring /usr/share/keyrings/k6-archive-keyring.gpg --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys C5AD17C747E3415A3642D57D77C6C491D6AC1D69
+        echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] https://dl.k6.io/deb stable main" | sudo tee /etc/apt/sources.list.d/k6.list
+        sudo apt-get update
+        sudo apt-get install k6
+
+    - name: Run load tests
+      env:
+        STAGING_URL: https://staging.ecommerce.example.com
+      run: |
+        cd tests/performance
+        k6 run --out json=results.json load-test.js
+
+    - name: Upload performance results
+      uses: actions/upload-artifact@v3
+      with:
+        name: performance-results
+        path: tests/performance/results.json
+
+    - name: Performance regression check
+      run: |
+        # Check if performance metrics meet thresholds
+        cd tests/performance
+        python check_performance.py results.json
+
+  # Security scanning and compliance
+  security-compliance:
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    if: github.ref == 'refs/heads/develop'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install kubectl
+      uses: azure/setup-kubectl@v3
+      with:
+        version: 'v1.28.0'
+
+    - name: Configure kubectl for staging
+      run: |
+        mkdir -p ~/.kube
+        echo "${{ secrets.STAGING_KUBECONFIG }}" | base64 -d > ~/.kube/config
+
+    - name: Install kube-bench
+      run: |
+        curl -L https://github.com/aquasecurity/kube-bench/releases/download/v0.6.15/kube-bench_0.6.15_linux_amd64.tar.gz -o kube-bench.tar.gz
+        tar -xzf kube-bench.tar.gz
+
+    - name: Run CIS Kubernetes Benchmark
+      run: |
+        ./kube-bench run --targets node,policies,managedservices --json > kube-bench-results.json
+        cat kube-bench-results.json
+
+    - name: Install kube-hunter
+      run: |
+        pip3 install kube-hunter
+
+    - name: Run penetration testing
+      run: |
+        kube-hunter --remote staging.ecommerce.example.com --report json > kube-hunter-results.json
+        cat kube-hunter-results.json
+
+    - name: Upload security reports
+      uses: actions/upload-artifact@v3
+      with:
+        name: security-compliance-reports
+        path: |
+          kube-bench-results.json
+          kube-hunter-results.json
+
+  # Notification and reporting
+  notify:
+    runs-on: ubuntu-latest
+    needs: [deploy-staging, deploy-production, performance-test, security-compliance]
+    if: always()
+    
+    steps:
+    - name: Notify Slack on success
+      if: success()
+      uses: 8398a7/action-slack@v3
+      with:
+        status: success
+        text: "🚀 Deployment successful! All tests passed."
+        webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+
+    - name: Notify Slack on failure
+      if: failure()
+      uses: 8398a7/action-slack@v3
+      with:
+        status: failure
+        text: "❌ Deployment failed! Check the logs for details."
+        webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+
+    - name: Update deployment metrics
+      run: |
+        # Send metrics to monitoring system
+        curl -X POST "${{ secrets.METRICS_ENDPOINT }}" \
+          -H "Content-Type: application/json" \
+          -d '{
+            "deployment_time": "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'",
+            "commit_sha": "'${{ github.sha }}'",
+            "branch": "'${{ github.ref_name }}'",
+            "status": "'${{ job.status }}'"
+          }'
