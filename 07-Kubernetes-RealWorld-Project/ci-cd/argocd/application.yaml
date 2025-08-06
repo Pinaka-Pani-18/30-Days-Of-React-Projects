@@ -1,0 +1,188 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: ecommerce-staging
+  namespace: argocd
+  labels:
+    app.kubernetes.io/name: ecommerce
+    app.kubernetes.io/environment: staging
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/your-org/k8s-ecommerce-platform.git
+    targetRevision: develop
+    path: k8s-manifests/overlays/staging
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: staging
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+      allowEmpty: false
+    syncOptions:
+    - Validate=true
+    - CreateNamespace=true
+    - PrunePropagationPolicy=foreground
+    - PruneLast=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m
+  revisionHistoryLimit: 10
+  ignoreDifferences:
+  - group: apps
+    kind: Deployment
+    jsonPointers:
+    - /spec/replicas
+  - group: ""
+    kind: Service
+    jsonPointers:
+    - /spec/clusterIP
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: ecommerce-production
+  namespace: argocd
+  labels:
+    app.kubernetes.io/name: ecommerce
+    app.kubernetes.io/environment: production
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  project: ecommerce-production
+  source:
+    repoURL: https://github.com/your-org/k8s-ecommerce-platform.git
+    targetRevision: main
+    path: k8s-manifests/overlays/production
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: production
+  syncPolicy:
+    # Manual sync for production
+    automated:
+      prune: false
+      selfHeal: false
+    syncOptions:
+    - Validate=true
+    - CreateNamespace=true
+    - PrunePropagationPolicy=foreground
+    retry:
+      limit: 3
+      backoff:
+        duration: 10s
+        factor: 2
+        maxDuration: 5m
+  revisionHistoryLimit: 20
+  ignoreDifferences:
+  - group: apps
+    kind: Deployment
+    jsonPointers:
+    - /spec/replicas
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: ecommerce-production
+  namespace: argocd
+  labels:
+    app.kubernetes.io/name: ecommerce-project
+spec:
+  description: E-Commerce Production Project
+  sourceRepos:
+  - 'https://github.com/your-org/k8s-ecommerce-platform.git'
+  destinations:
+  - namespace: production
+    server: https://kubernetes.default.svc
+  - namespace: monitoring
+    server: https://kubernetes.default.svc
+  clusterResourceWhitelist:
+  - group: ''
+    kind: Namespace
+  - group: 'rbac.authorization.k8s.io'
+    kind: ClusterRole
+  - group: 'rbac.authorization.k8s.io'
+    kind: ClusterRoleBinding
+  namespaceResourceWhitelist:
+  - group: 'apps'
+    kind: Deployment
+  - group: 'apps'
+    kind: StatefulSet
+  - group: ''
+    kind: Service
+  - group: ''
+    kind: ConfigMap
+  - group: ''
+    kind: Secret
+  - group: ''
+    kind: PersistentVolumeClaim
+  - group: 'networking.k8s.io'
+    kind: Ingress
+  - group: 'autoscaling'
+    kind: HorizontalPodAutoscaler
+  roles:
+  - name: production-admin
+    description: Full access to production environment
+    policies:
+    - p, proj:ecommerce-production:production-admin, applications, *, ecommerce-production/*, allow
+    - p, proj:ecommerce-production:production-admin, repositories, *, *, allow
+    groups:
+    - your-org:production-team
+  - name: production-readonly
+    description: Read-only access to production environment
+    policies:
+    - p, proj:ecommerce-production:production-readonly, applications, get, ecommerce-production/*, allow
+    - p, proj:ecommerce-production:production-readonly, applications, action/*, ecommerce-production/*, deny
+    groups:
+    - your-org:developers
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: monitoring-stack
+  namespace: argocd
+  labels:
+    app.kubernetes.io/name: monitoring
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/your-org/k8s-ecommerce-platform.git
+    targetRevision: main
+    path: monitoring
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: monitoring
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+    - CreateNamespace=true
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: security-stack
+  namespace: argocd
+  labels:
+    app.kubernetes.io/name: security
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/your-org/k8s-ecommerce-platform.git
+    targetRevision: main
+    path: k8s-manifests/security
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: security
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+    - CreateNamespace=true
